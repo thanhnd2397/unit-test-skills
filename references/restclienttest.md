@@ -1,203 +1,204 @@
-# @RestClientTest
+# @RestClientTest (Boot 2.0.3)
 
-Testing REST clients in isolation with MockRestServiceServer.
+Testing code that calls an external HTTP API, with `MockRestServiceServer` standing in for the remote service. No network, no WireMock.
 
-## Overview
+## What it auto-configures
 
-`@RestClientTest` auto-configures:
+- `RestTemplateBuilder` wired to a mock request factory
+- `MockRestServiceServer` bound to that builder
+- Jackson `ObjectMapper` and the standard message converters
+- The classes listed in the annotation (`@RestClientTest(WeatherService.class)`)
 
-- RestTemplate/RestClient with mock server support
-- Jackson ObjectMapper
-- MockRestServiceServer
+On this stack the client is always `RestTemplate` — `RestClient` is Spring Framework 6.1.
 
-## Basic Setup
+## Requirement on the class under test
+
+The service must build its `RestTemplate` from an injected `RestTemplateBuilder`, otherwise the mock server has nothing to intercept:
 
 ```java
-@RestClientTest(WeatherService.class)
-class WeatherServiceTest {
-  
-  @Autowired
-  private WeatherService weatherService;
-  
-  @Autowired
-  private MockRestServiceServer server;
+@Service
+public class WeatherService {
+
+  private final RestTemplate restTemplate;
+
+  public WeatherService(RestTemplateBuilder builder) {
+    this.restTemplate = builder.rootUri("https://api.weather.com").build();
+  }
+
+  public Weather getCurrentWeather(String city) {
+    return restTemplate.getForObject("/v1/current?city={city}", Weather.class, city);
+  }
 }
 ```
 
-## Testing RestTemplate
+A service that does `new RestTemplate()` internally cannot be tested this way — either refactor it to take the builder, or inject a `RestTemplate` bean and bind the mock server manually:
 
 ```java
+RestTemplate restTemplate = new RestTemplate();
+MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
+WeatherService service = new WeatherService(restTemplate);
+```
+
+That form needs no Spring context at all and is often the better test.
+
+## Basic test
+
+```java
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.client.RestClientTest;
+import org.springframework.test.context.junit.jupiter.SpringExtension;
+import org.springframework.test.web.client.MockRestServiceServer;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.*;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.*;
+
+@ExtendWith(SpringExtension.class)      // REQUIRED on Boot 2.0.3
 @RestClientTest(WeatherService.class)
 class WeatherServiceTest {
-  
+
   @Autowired
   private WeatherService weatherService;
-  
+
   @Autowired
   private MockRestServiceServer server;
-  
+
   @Test
   void shouldFetchWeather() {
-    // Given
-    server.expect(requestTo("https://api.weather.com/v1/current"))
-      .andExpect(method(HttpMethod.GET))
-      .andExpect(queryParam("city", "Berlin"))
-      .andRespond(withSuccess()
-        .contentType(MediaType.APPLICATION_JSON)
-        .body("{\"temperature\": 22, \"condition\": \"Sunny\"}"));
-    
-    // When
-    Weather weather = weatherService.getCurrentWeather("Berlin");
-    
-    // Then
+    server.expect(requestTo("https://api.weather.com/v1/current?city=Hanoi"))
+          .andExpect(method(HttpMethod.GET))
+          .andRespond(withSuccess("{\"temperature\":22,\"condition\":\"Sunny\"}",
+                                  MediaType.APPLICATION_JSON));
+
+    Weather weather = weatherService.getCurrentWeather("Hanoi");
+
     assertThat(weather.getTemperature()).isEqualTo(22);
     assertThat(weather.getCondition()).isEqualTo("Sunny");
+    server.verify();
   }
 }
 ```
 
-## Testing RestClient (Spring 6.1+)
+## Request matching
 
 ```java
-@RestClientTest(WeatherService.class)
-class WeatherServiceTest {
-  
-  @Autowired
-  private WeatherService weatherService;
-  
-  @Autowired
-  private MockRestServiceServer server;
-  
-  @Test
-  void shouldFetchWeatherWithRestClient() {
-    server.expect(requestTo("https://api.weather.com/v1/current"))
-      .andRespond(withSuccess()
-        .body("{\"temperature\": 22}"));
-    
-    Weather weather = weatherService.getCurrentWeather("Berlin");
-    
-    assertThat(weather.getTemperature()).isEqualTo(22);
-  }
-}
-```
+// exact URI
+server.expect(requestTo("https://api.example.com/users/1")).andRespond(withSuccess());
 
-## Request Matching
-
-### Exact URL
-
-```java
-server.expect(requestTo("https://api.example.com/users/1"))
-  .andRespond(withSuccess());
-```
-
-### URL Pattern
-
-```java
+// URI pattern (Hamcrest)
 server.expect(requestTo(matchesPattern("https://api.example.com/users/\\d+")))
-  .andRespond(withSuccess());
-```
+      .andRespond(withSuccess());
 
-### HTTP Method
+// method + query parameter
+server.expect(requestTo(containsString("/users")))
+      .andExpect(method(HttpMethod.GET))
+      .andExpect(queryParam("page", "0"))
+      .andRespond(withSuccess());
 
-```java
-server.expect(ExpectedCount.once(), 
-  requestTo("https://api.example.com/users"))
-  .andExpect(method(HttpMethod.POST))
-  .andRespond(withCreatedEntity(URI.create("/users/1")));
-```
+// expected call count
+server.expect(ExpectedCount.once(), requestTo("https://api.example.com/users"))
+      .andExpect(method(HttpMethod.POST))
+      .andRespond(withCreatedEntity(URI.create("/users/1")));
 
-### Request Body
+server.expect(ExpectedCount.manyTimes(), requestTo(matchesPattern(".*/api/.*")))
+      .andRespond(withSuccess());
 
-```java
+// request body
 server.expect(requestTo("https://api.example.com/users"))
-  .andExpect(content().contentType(MediaType.APPLICATION_JSON))
-  .andExpect(content().json("{\"name\": \"John\"}"))
-  .andRespond(withSuccess());
-```
+      .andExpect(content().contentType(MediaType.APPLICATION_JSON))
+      .andExpect(content().json("{\"name\":\"John\"}"))
+      .andRespond(withSuccess());
 
-### Headers
-
-```java
+// request body by JSON path
 server.expect(requestTo("https://api.example.com/users"))
-  .andExpect(header("Authorization", "Bearer token123"))
-  .andExpect(header("X-Api-Key", "secret"))
-  .andRespond(withSuccess());
+      .andExpect(jsonPath("$.name").value("John"))
+      .andRespond(withSuccess());
+
+// headers
+server.expect(requestTo("https://api.example.com/users"))
+      .andExpect(header("Authorization", "Bearer token123"))
+      .andExpect(header("X-Api-Key", "secret"))
+      .andRespond(withSuccess());
 ```
 
-## Response Types
+`requestTo(...)` accepts a `String`, a `URI` or a Hamcrest matcher. Match on the minimum that makes the test meaningful — asserting every header makes the test brittle.
 
-### Success with Body
+## Responses
 
 ```java
+// success with a JSON body
 server.expect(requestTo("/users/1"))
-  .andRespond(withSuccess()
-    .contentType(MediaType.APPLICATION_JSON)
-    .body("{\"id\": 1, \"name\": \"John\"}"));
-```
+      .andRespond(withSuccess("{\"id\":1,\"name\":\"John\"}", MediaType.APPLICATION_JSON));
 
-### Success from Resource
-
-```java
+// success from a classpath resource — preferred for large payloads
 server.expect(requestTo("/users/1"))
-  .andRespond(withSuccess()
-    .body(new ClassPathResource("user-response.json")));
+      .andRespond(withSuccess(new ClassPathResource("stubs/user-1.json"),
+                              MediaType.APPLICATION_JSON));
+
+// created
+server.expect(requestTo("/users"))
+      .andExpect(method(HttpMethod.POST))
+      .andRespond(withCreatedEntity(URI.create("/users/1")));
+
+// errors
+server.expect(requestTo("/users/999")).andRespond(withResourceNotFound());
+server.expect(requestTo("/users")).andRespond(withServerError().body("boom"));
+server.expect(requestTo("/users")).andRespond(withBadRequest().body("{\"error\":\"invalid\"}"));
+server.expect(requestTo("/users")).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
+
+// transport failure
+server.expect(requestTo("/users")).andRespond(withException(new SocketTimeoutException()));
 ```
 
-### Created
+`withException(...)` is how you test timeout and connection-failure handling on this stack. `DefaultResponseCreator.delay(...)` is a later Spring addition and is not available — do not try to simulate latency.
 
-```java
-server.expect(requestTo("/users"))
-  .andExpect(method(HttpMethod.POST))
-  .andRespond(withCreatedEntity(URI.create("/users/1")));
-```
-
-### Error Response
-
-```java
-server.expect(requestTo("/users/999"))
-  .andRespond(withResourceNotFound());
-
-server.expect(requestTo("/users"))
-  .andRespond(withServerError()
-    .body("Internal Server Error"));
-
-server.expect(requestTo("/users"))
-  .andRespond(withStatus(HttpStatus.BAD_REQUEST)
-    .body("{\"error\": \"Invalid input\"}"));
-```
-
-## Verifying Requests
+## Testing error handling
 
 ```java
 @Test
-void shouldCallApi() {
-  server.expect(ExpectedCount.once(), 
-    requestTo("https://api.example.com/data"))
-    .andRespond(withSuccess());
-  
+void shouldWrapNotFoundInDomainException() {
+  server.expect(requestTo("https://api.weather.com/v1/current?city=Nowhere"))
+        .andRespond(withResourceNotFound());
+
+  assertThatThrownBy(() -> weatherService.getCurrentWeather("Nowhere"))
+      .isInstanceOf(WeatherUnavailableException.class)
+      .hasMessageContaining("Nowhere");
+
+  server.verify();
+}
+
+@Test
+void shouldFallBackOnServerError() {
+  server.expect(requestTo(containsString("/v1/current")))
+        .andRespond(withServerError());
+
+  Weather weather = weatherService.getCurrentWeatherOrDefault("Hanoi");
+
+  assertThat(weather.getCondition()).isEqualTo("UNKNOWN");
+}
+```
+
+Error paths are the reason this slice exists — a client that is only tested on 200 responses is untested.
+
+## Verifying and resetting
+
+```java
+@Test
+void shouldCallApiExactlyOnce() {
+  server.expect(ExpectedCount.once(), requestTo("https://api.example.com/data"))
+        .andRespond(withSuccess());
+
   service.fetchData();
-  
-  server.verify(); // Verify all expectations met
+
+  server.verify();          // fails if the expectation was not met
 }
 ```
 
-## Ignoring Extra Requests
+`server.verify()` is what turns "the code compiled and returned" into "the request was actually made as specified". Call it at the end of every test, or use `server.verify(Duration)`-free form as above.
 
-```java
-@Test
-void shouldHandleMultipleCalls() {
-  server.expect(ExpectedCount.manyTimes(),
-    requestTo(matchesPattern("/api/.*")))
-    .andRespond(withSuccess());
-  
-  // Multiple calls allowed
-  service.callApi();
-  service.callApi();
-  service.callApi();
-}
-```
-
-## Reset Between Tests
+Expectations are per-test; the slice gives each test method a fresh server, but when sharing setup across methods:
 
 ```java
 @BeforeEach
@@ -206,22 +207,20 @@ void setUp() {
 }
 ```
 
-## Testing Timeouts
+## Ignoring request order
 
 ```java
-server.expect(requestTo("/slow-endpoint"))
-  .andRespond(withSuccess()
-    .body("{\"data\": \"test\"}")
-    .delay(100, TimeUnit.MILLISECONDS));
-
-// Test timeout handling
+server = MockRestServiceServer.bindTo(restTemplate).ignoreExpectOrder(true).build();
 ```
 
-## Best Practices
+With the auto-configured server inside `@RestClientTest`, expectations are matched in declaration order by default — declare them in the order the code will call them, or build the server manually when order genuinely does not matter.
 
-1. Always verify `server.verify()` at end of test
-2. Use resource files for large JSON responses
-3. Match on minimal set of request attributes
-4. Reset server in @BeforeEach
-5. Test error responses, not just success
-6. Verify request body for POST/PUT calls
+## Key points
+
+1. **`@ExtendWith(SpringExtension.class)` first**
+2. The class under test must accept `RestTemplateBuilder` (or a `RestTemplate`) — otherwise the mock cannot intercept
+3. **`server.verify()`** at the end of each test
+4. Stub bodies from `src/test/resources` once they exceed a line or two (no text blocks on Java 8)
+5. **Test the error paths**: 404, 500, timeout via `withException`
+6. Match on the minimum set of request attributes
+7. No `.delay(...)`, no `RestClient`, no WireMock on this stack
